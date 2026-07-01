@@ -3,7 +3,7 @@ import requests
 from datetime import datetime, timezone
 from functools import wraps
 
-ENDPOINT = "https://ai-cost-pilot-asic.vercel.app/api/track"
+ENDPOINT = "https://my-tokenlens.vercel.app/api/track"
 
 PRICING = {
     "claude-sonnet-4-6": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
