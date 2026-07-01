@@ -1,0 +1,8 @@
+setup.py
+aicostpilot/__init__.py
+aicostpilot/tracker.py
+aicostpilot.egg-info/PKG-INFO
+aicostpilot.egg-info/SOURCES.txt
+aicostpilot.egg-info/dependency_links.txt
+aicostpilot.egg-info/requires.txt
+aicostpilot.egg-info/top_level.txt
