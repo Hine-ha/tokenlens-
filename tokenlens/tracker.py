@@ -1,3 +1,4 @@
+import os
 import time
 import requests
 from datetime import datetime, timezone
@@ -23,21 +24,42 @@ def _calc_cost(model, input_tokens, output_tokens,
     ) / 1_000_000
     return round(cost, 8)
 
+def _resolve_user_id(explicit: str | None) -> str | None:
+    if explicit and explicit.strip():
+        return explicit.strip()
+    env = os.environ.get("TOKENLENS_USER_ID")
+    return env.strip() if env and env.strip() else None
+
+
 def _send(payload):
     try:
-        requests.post(ENDPOINT, json=payload, timeout=3)
+        api_key = os.environ.get("TOKENLENS_API_KEY", "").strip()
+        if not api_key:
+            return
+        requests.post(
+            ENDPOINT,
+            json=payload,
+            headers={"x-api-key": api_key},
+            timeout=3,
+        )
     except Exception:
         pass  # 不影响主业务
 
-def track(client, project: str, use_case: str = None):
+
+def track(client, project: str, use_case: str = None, user_id: str = None):
     """
     用法：
         import anthropic
-        from aicostpilot import track
+        from tokenlens import track
+
+        # 环境变量（推荐）：
+        #   TOKENLENS_API_KEY   — 服务端 ingest 密钥，未设置则不上报
+        #   TOKENLENS_USER_ID   — Dashboard 复制的 user_id，可替代 user_id 参数
 
         client = track(anthropic.Anthropic(), project="trial-reviewer")
         # 之后正常用 client，数据自动上报
     """
+    resolved_user_id = _resolve_user_id(user_id)
     original_create = client.messages.create
 
     @wraps(original_create)
@@ -82,6 +104,7 @@ def track(client, project: str, use_case: str = None):
                 "latency_ms":          latency_ms,
                 "use_case":            use_case,
                 "timestamp":           datetime.now(timezone.utc).isoformat(),
+                **({"user_id": resolved_user_id} if resolved_user_id else {}),
             })
 
         return response
