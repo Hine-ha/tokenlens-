@@ -1,9 +1,8 @@
 import json
 import os
-import time
+import threading
 import requests
 from datetime import datetime, timezone
-from functools import wraps
 
 ENDPOINT = "https://my-tokenlens.vercel.app/api/track"
 
@@ -22,19 +21,10 @@ PRICING = {
 }
 
 
-def _calc_cost(
-    model,
-    input_tokens,
-    output_tokens,
-    cache_read_tokens=0,
-    cache_write_tokens=0,
-):
+def _calc_cost(model, input_tokens, output_tokens):
     p = PRICING.get(model, {"input": 0, "output": 0})
     cost = (
-        input_tokens * p.get("input", 0)
-        + output_tokens * p.get("output", 0)
-        + cache_read_tokens * p.get("cache_read", 0)
-        + cache_write_tokens * p.get("cache_write", 0)
+        input_tokens * p.get("input", 0) + output_tokens * p.get("output", 0)
     ) / 1_000_000
     return round(cost, 8)
 
@@ -46,23 +36,30 @@ def _resolve_user_id(explicit: str | None) -> str | None:
     return env.strip() if env and env.strip() else None
 
 
-def _send(payload):
+def _send_sync(payload: dict) -> None:
+    """POST usage to TokenLens only. Never touches Anthropic/OpenAI clients."""
     try:
         api_key = os.environ.get("TOKENLENS_API_KEY", "").strip()
         if not api_key:
             return
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        api_key.encode("ascii")
+
+        body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
         requests.post(
             ENDPOINT,
             data=body,
             headers={
                 "x-api-key": api_key,
-                "Content-Type": "application/json; charset=utf-8",
+                "Content-Type": "application/json",
             },
             timeout=3,
         )
     except Exception:
         pass
+
+
+def _send(payload: dict) -> None:
+    threading.Thread(target=_send_sync, args=(payload,), daemon=True).start()
 
 
 def _detect_provider(client) -> str:
@@ -81,95 +78,84 @@ def _detect_provider(client) -> str:
 
 def _extract_usage(response, provider: str):
     if not response or not hasattr(response, "usage"):
-        return 0, 0, 0, 0
+        return 0, 0
 
     usage = response.usage
     if provider == "anthropic":
         return (
             getattr(usage, "input_tokens", 0) or 0,
             getattr(usage, "output_tokens", 0) or 0,
-            getattr(usage, "cache_read_input_tokens", 0) or 0,
-            getattr(usage, "cache_creation_input_tokens", 0) or 0,
         )
 
     return (
         getattr(usage, "prompt_tokens", 0) or 0,
         getattr(usage, "completion_tokens", 0) or 0,
-        0,
-        0,
     )
 
 
-def _wrap_create(original_create, *, provider, project, use_case, resolved_user_id):
-    @wraps(original_create)
+def _build_track_payload(
+    *,
+    project: str,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cost: float,
+    resolved_user_id: str | None,
+) -> dict:
+    """Fields for TokenLens /api/track only (not sent to LLM APIs)."""
+    payload = {
+        "project_name": project,
+        "model": model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cost": cost,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if resolved_user_id:
+        payload["user_id"] = resolved_user_id
+    return payload
+
+
+def _wrap_create(original_create, *, provider, project, resolved_user_id):
     def tracked_create(*args, **kwargs):
-        start = time.time()
-        success = True
-        error_type = None
         response = None
-
         try:
+            # Pass through unchanged — no extra headers or kwargs for LLM APIs.
             response = original_create(*args, **kwargs)
-        except Exception as e:
-            success = False
-            error_type = type(e).__name__
-            raise
+            return response
         finally:
-            latency_ms = int((time.time() - start) * 1000)
             model = kwargs.get("model", "unknown")
-            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens = (
-                _extract_usage(response, provider)
-            )
-            cost = _calc_cost(
-                model,
-                input_tokens,
-                output_tokens,
-                cache_read_tokens,
-                cache_write_tokens,
-            )
-
+            input_tokens, output_tokens = _extract_usage(response, provider)
+            cost = _calc_cost(model, input_tokens, output_tokens)
             _send(
-                {
-                    "project_name": project,
-                    "model": model,
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "cache_read_tokens": cache_read_tokens,
-                    "cache_write_tokens": cache_write_tokens,
-                    "cost": cost,
-                    "success": success,
-                    "error_type": error_type,
-                    "latency_ms": latency_ms,
-                    "use_case": use_case,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    **({"user_id": resolved_user_id} if resolved_user_id else {}),
-                }
+                _build_track_payload(
+                    project=project,
+                    model=model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cost=cost,
+                    resolved_user_id=resolved_user_id,
+                )
             )
 
-        return response
-
+    tracked_create.__name__ = getattr(original_create, "__name__", "create")
+    tracked_create.__doc__ = getattr(original_create, "__doc__", None)
     return tracked_create
 
 
 def track(client, project: str, use_case: str = None, user_id: str = None):
     """
-    用法（Anthropic）：
-        import anthropic
-        from tokenlens import track
+    Wrap Anthropic or OpenAI client for automatic usage tracking.
 
+    Anthropic:
         client = track(anthropic.Anthropic(), project="my-app")
         client.messages.create(...)
 
-    用法（OpenAI）：
-        import openai
-        from tokenlens import track
-
+    OpenAI:
         client = track(openai.OpenAI(), project="my-app")
         client.chat.completions.create(...)
 
-    环境变量（推荐）：
-        TOKENLENS_API_KEY  — ingest 密钥，未设置则不上报
-        TOKENLENS_USER_ID  — Dashboard 复制的 user_id
+    Env: TOKENLENS_API_KEY, TOKENLENS_USER_ID (optional)
     """
     resolved_user_id = _resolve_user_id(user_id)
     provider = _detect_provider(client)
@@ -179,7 +165,6 @@ def track(client, project: str, use_case: str = None, user_id: str = None):
             client.messages.create,
             provider=provider,
             project=project,
-            use_case=use_case,
             resolved_user_id=resolved_user_id,
         )
     else:
@@ -187,7 +172,6 @@ def track(client, project: str, use_case: str = None, user_id: str = None):
             client.chat.completions.create,
             provider=provider,
             project=project,
-            use_case=use_case,
             resolved_user_id=resolved_user_id,
         )
 
