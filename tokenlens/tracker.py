@@ -6,6 +6,9 @@ from datetime import datetime, timezone
 
 ENDPOINT = "https://my-tokenlens.vercel.app/api/track"
 
+AUTO_CACHE_MIN_SYSTEM_LEN = 1024
+CACHE_CONTROL = {"type": "ephemeral"}
+
 PRICING = {
     # Anthropic
     "claude-sonnet-4-6": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
@@ -76,6 +79,74 @@ def _detect_provider(client) -> str:
     )
 
 
+def _block_text_length(block) -> int:
+    if isinstance(block, dict):
+        if block.get("type") == "text":
+            return len(block.get("text") or "")
+        return len(str(block.get("text", "")))
+    text = getattr(block, "text", None)
+    if text is not None:
+        return len(text)
+    return 0
+
+
+def _block_to_dict_with_cache(block) -> dict:
+    if isinstance(block, dict):
+        updated = dict(block)
+    else:
+        updated = {
+            "type": getattr(block, "type", "text"),
+            "text": getattr(block, "text", ""),
+        }
+    updated["cache_control"] = CACHE_CONTROL
+    return updated
+
+
+def _apply_auto_cache(kwargs: dict) -> dict:
+    """Inject Anthropic prompt cache_control into system when enabled."""
+    if "system" not in kwargs:
+        return kwargs
+
+    system = kwargs["system"]
+
+    if isinstance(system, str):
+        if len(system) <= AUTO_CACHE_MIN_SYSTEM_LEN:
+            return kwargs
+        updated = dict(kwargs)
+        updated["system"] = [
+            {
+                "type": "text",
+                "text": system,
+                "cache_control": CACHE_CONTROL,
+            }
+        ]
+        return updated
+
+    if isinstance(system, list):
+        best_idx = None
+        best_len = -1
+        for i, block in enumerate(system):
+            length = _block_text_length(block)
+            if length > best_len:
+                best_len = length
+                best_idx = i
+
+        if best_idx is None:
+            return kwargs
+
+        block = system[best_idx]
+        if isinstance(block, dict) and block.get("cache_control"):
+            return kwargs
+
+        updated = dict(kwargs)
+        new_system = list(system)
+        new_system[best_idx] = _block_to_dict_with_cache(block)
+        updated["system"] = new_system
+        return updated
+
+    return kwargs
+
+
 def _extract_usage(response, provider: str):
     if not response or not hasattr(response, "usage"):
         return 0, 0
@@ -116,15 +187,25 @@ def _build_track_payload(
     return payload
 
 
-def _wrap_create(original_create, *, provider, project, resolved_user_id):
+def _wrap_create(
+    original_create,
+    *,
+    provider,
+    project,
+    resolved_user_id,
+    auto_cache=False,
+):
     def tracked_create(*args, **kwargs):
         response = None
+        call_kwargs = kwargs
+        if auto_cache and provider == "anthropic":
+            call_kwargs = _apply_auto_cache(kwargs)
+
         try:
-            # Pass through unchanged — no extra headers or kwargs for LLM APIs.
-            response = original_create(*args, **kwargs)
+            response = original_create(*args, **call_kwargs)
             return response
         finally:
-            model = kwargs.get("model", "unknown")
+            model = call_kwargs.get("model", kwargs.get("model", "unknown"))
             input_tokens, output_tokens = _extract_usage(response, provider)
             cost = _calc_cost(model, input_tokens, output_tokens)
             _send(
@@ -143,17 +224,25 @@ def _wrap_create(original_create, *, provider, project, resolved_user_id):
     return tracked_create
 
 
-def track(client, project: str, use_case: str = None, user_id: str = None):
+def track(
+    client,
+    project: str,
+    use_case: str = None,
+    user_id: str = None,
+    auto_cache: bool = False,
+):
     """
     Wrap Anthropic or OpenAI client for automatic usage tracking.
 
     Anthropic:
-        client = track(anthropic.Anthropic(), project="my-app")
+        client = track(anthropic.Anthropic(), project="my-app", auto_cache=True)
         client.messages.create(...)
 
     OpenAI:
         client = track(openai.OpenAI(), project="my-app")
         client.chat.completions.create(...)
+
+    auto_cache: Anthropic only — inject cache_control on long system prompts.
 
     Env: TOKENLENS_API_KEY, TOKENLENS_USER_ID (optional)
     """
@@ -166,6 +255,7 @@ def track(client, project: str, use_case: str = None, user_id: str = None):
             provider=provider,
             project=project,
             resolved_user_id=resolved_user_id,
+            auto_cache=auto_cache,
         )
     else:
         client.chat.completions.create = _wrap_create(
@@ -173,6 +263,7 @@ def track(client, project: str, use_case: str = None, user_id: str = None):
             provider=provider,
             project=project,
             resolved_user_id=resolved_user_id,
+            auto_cache=False,
         )
 
     return client
