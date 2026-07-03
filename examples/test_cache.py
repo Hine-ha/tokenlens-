@@ -46,7 +46,18 @@ def min_repeat(model: str) -> int:
 
 def run(model: str, repeat: int) -> None:
     import anthropic
-    from tokenlens import track
+    from tokenlens import flush, track
+
+    if not clean_env("TOKENLENS_API_KEY"):
+        print(
+            "警告: TOKENLENS_API_KEY 未设置，SDK 不会上报到 TokenLens Dashboard（静默跳过）。",
+            file=sys.stderr,
+        )
+    elif not clean_env("TOKENLENS_USER_ID"):
+        print(
+            "提示: TOKENLENS_USER_ID 未设置，事件会以 user_id=null 入库。",
+            file=sys.stderr,
+        )
 
     api_key = clean_env("ANTHROPIC_API_KEY")
     require_ascii("ANTHROPIC_API_KEY", api_key)
@@ -98,6 +109,9 @@ def run(model: str, repeat: int) -> None:
         sys.exit(1)
 
     print("缓存测试通过：第二次已命中 cache_read。")
+    if clean_env("TOKENLENS_API_KEY"):
+        flush()
+        print("TokenLens 上报已完成。运行 python3 examples/check_ingest.py 验证 Dashboard 数据。")
 
 
 def main() -> None:

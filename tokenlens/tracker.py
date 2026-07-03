@@ -1,9 +1,13 @@
+import atexit
 import json
 import os
 import threading
 import time
 import requests
 from datetime import datetime, timezone
+
+_pending_send_threads: list[threading.Thread] = []
+_pending_lock = threading.Lock()
 
 ENDPOINT = "https://my-tokenlens.vercel.app/api/track"
 
@@ -61,8 +65,33 @@ def _send_sync(payload: dict) -> None:
         pass
 
 
+def flush(timeout: float = 5.0) -> None:
+    """Wait for in-flight TokenLens track requests (call before script exit)."""
+    with _pending_lock:
+        threads = list(_pending_send_threads)
+    for thread in threads:
+        thread.join(timeout=timeout)
+    with _pending_lock:
+        _pending_send_threads[:] = [
+            t for t in _pending_send_threads if t.is_alive()
+        ]
+
+
+def _flush_on_exit() -> None:
+    flush(timeout=5.0)
+
+
+atexit.register(_flush_on_exit)
+
+
 def _send(payload: dict) -> None:
-    threading.Thread(target=_send_sync, args=(payload,), daemon=True).start()
+    thread = threading.Thread(target=_send_sync, args=(payload,), daemon=False)
+    thread.start()
+    with _pending_lock:
+        _pending_send_threads.append(thread)
+        _pending_send_threads[:] = [
+            t for t in _pending_send_threads if t.is_alive()
+        ]
 
 
 def _detect_provider(client) -> str:

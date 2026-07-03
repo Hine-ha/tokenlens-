@@ -1,3 +1,3 @@
-from .tracker import track
+from .tracker import flush, track
 
-__all__ = ["track"]
+__all__ = ["track", "flush"]
