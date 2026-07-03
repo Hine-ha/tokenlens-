@@ -47,13 +47,13 @@ def _send_sync(payload: dict) -> None:
             return
         api_key.encode("ascii")
 
-        body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         requests.post(
             ENDPOINT,
             data=body,
             headers={
                 "x-api-key": api_key,
-                "Content-Type": "application/json",
+                "Content-Type": "application/json; charset=utf-8",
             },
             timeout=3,
         )
@@ -102,25 +102,18 @@ def _block_to_dict_with_cache(block) -> dict:
     return updated
 
 
-def _apply_auto_cache(kwargs: dict) -> dict:
-    """Inject Anthropic prompt cache_control into system when enabled."""
-    if "system" not in kwargs:
-        return kwargs
-
-    system = kwargs["system"]
-
+def _transform_system_for_cache(system):
+    """Return new system value for cache_control, or None if unchanged."""
     if isinstance(system, str):
         if len(system) <= AUTO_CACHE_MIN_SYSTEM_LEN:
-            return kwargs
-        updated = dict(kwargs)
-        updated["system"] = [
+            return None
+        return [
             {
                 "type": "text",
                 "text": system,
                 "cache_control": CACHE_CONTROL,
             }
         ]
-        return updated
 
     if isinstance(system, list):
         best_idx = None
@@ -132,19 +125,31 @@ def _apply_auto_cache(kwargs: dict) -> dict:
                 best_idx = i
 
         if best_idx is None:
-            return kwargs
+            return None
 
         block = system[best_idx]
         if isinstance(block, dict) and block.get("cache_control"):
-            return kwargs
+            return None
 
-        updated = dict(kwargs)
         new_system = list(system)
         new_system[best_idx] = _block_to_dict_with_cache(block)
-        updated["system"] = new_system
-        return updated
+        return new_system
 
-    return kwargs
+    return None
+
+
+def _kwargs_with_cached_system(kwargs: dict) -> dict:
+    """Override kwargs['system'] only. Header fields are never modified."""
+    if "system" not in kwargs:
+        return kwargs
+
+    new_system = _transform_system_for_cache(kwargs["system"])
+    if new_system is None:
+        return kwargs
+
+    call_kwargs = kwargs.copy()
+    call_kwargs["system"] = new_system
+    return call_kwargs
 
 
 def _extract_usage(response, provider: str):
@@ -196,11 +201,11 @@ def _wrap_create(
     auto_cache=False,
 ):
     def tracked_create(*args, **kwargs):
-        response = None
         call_kwargs = kwargs
         if auto_cache and provider == "anthropic":
-            call_kwargs = _apply_auto_cache(kwargs)
+            call_kwargs = _kwargs_with_cached_system(kwargs)
 
+        response = None
         try:
             response = original_create(*args, **call_kwargs)
             return response
