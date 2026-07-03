@@ -1,6 +1,7 @@
 import json
 import os
 import threading
+import time
 import requests
 from datetime import datetime, timezone
 
@@ -154,18 +155,22 @@ def _kwargs_with_cached_system(kwargs: dict) -> dict:
 
 def _extract_usage(response, provider: str):
     if not response or not hasattr(response, "usage"):
-        return 0, 0
+        return 0, 0, 0, 0
 
     usage = response.usage
     if provider == "anthropic":
         return (
             getattr(usage, "input_tokens", 0) or 0,
             getattr(usage, "output_tokens", 0) or 0,
+            getattr(usage, "cache_read_input_tokens", 0) or 0,
+            getattr(usage, "cache_creation_input_tokens", 0) or 0,
         )
 
     return (
         getattr(usage, "prompt_tokens", 0) or 0,
         getattr(usage, "completion_tokens", 0) or 0,
+        0,
+        0,
     )
 
 
@@ -175,8 +180,15 @@ def _build_track_payload(
     model: str,
     input_tokens: int,
     output_tokens: int,
+    cache_read_tokens: int,
+    cache_write_tokens: int,
     cost: float,
+    provider: str,
     resolved_user_id: str | None,
+    use_case: str | None,
+    success: bool,
+    error_type: str | None,
+    latency_ms: int,
 ) -> dict:
     """Fields for TokenLens /api/track only (not sent to LLM APIs)."""
     payload = {
@@ -184,11 +196,20 @@ def _build_track_payload(
         "model": model,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
         "cost": cost,
+        "provider": provider,
+        "success": success,
+        "latency_ms": latency_ms,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     if resolved_user_id:
         payload["user_id"] = resolved_user_id
+    if use_case:
+        payload["use_case"] = use_case
+    if error_type:
+        payload["error_type"] = error_type
     return payload
 
 
@@ -198,6 +219,7 @@ def _wrap_create(
     provider,
     project,
     resolved_user_id,
+    use_case=None,
     auto_cache=False,
 ):
     def tracked_create(*args, **kwargs):
@@ -206,12 +228,22 @@ def _wrap_create(
             call_kwargs = _kwargs_with_cached_system(kwargs)
 
         response = None
+        success = True
+        error_type = None
+        start = time.time()
         try:
             response = original_create(*args, **call_kwargs)
             return response
+        except Exception as exc:
+            success = False
+            error_type = type(exc).__name__
+            raise
         finally:
+            latency_ms = int((time.time() - start) * 1000)
             model = call_kwargs.get("model", kwargs.get("model", "unknown"))
-            input_tokens, output_tokens = _extract_usage(response, provider)
+            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens = (
+                _extract_usage(response, provider)
+            )
             cost = _calc_cost(model, input_tokens, output_tokens)
             _send(
                 _build_track_payload(
@@ -219,8 +251,15 @@ def _wrap_create(
                     model=model,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
+                    cache_read_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
                     cost=cost,
+                    provider=provider,
                     resolved_user_id=resolved_user_id,
+                    use_case=use_case,
+                    success=success,
+                    error_type=error_type,
+                    latency_ms=latency_ms,
                 )
             )
 
@@ -260,6 +299,7 @@ def track(
             provider=provider,
             project=project,
             resolved_user_id=resolved_user_id,
+            use_case=use_case,
             auto_cache=auto_cache,
         )
     else:
@@ -268,6 +308,7 @@ def track(
             provider=provider,
             project=project,
             resolved_user_id=resolved_user_id,
+            use_case=use_case,
             auto_cache=False,
         )
 
