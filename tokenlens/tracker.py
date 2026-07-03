@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 ENDPOINT = "https://my-tokenlens.vercel.app/api/track"
 
-AUTO_CACHE_MIN_SYSTEM_LEN = 1024
+AUTO_CACHE_MIN_SYSTEM_LEN = 1024  # legacy alias; see _min_cacheable_chars()
 CACHE_CONTROL = {"type": "ephemeral"}
 
 PRICING = {
@@ -80,6 +80,26 @@ def _detect_provider(client) -> str:
     )
 
 
+def _system_char_length(system) -> int:
+    if system is None:
+        return 0
+    if isinstance(system, str):
+        return len(system)
+    if isinstance(system, list):
+        return sum(_block_text_length(block) for block in system)
+    return 0
+
+
+def _min_cacheable_chars(model: str) -> int:
+    """Anthropic minimum cacheable prefix (approx. chars for CJK text)."""
+    name = (model or "").lower()
+    # Haiku 4.5 / Opus: 4096 tokens minimum per Anthropic docs
+    if "haiku-4-5" in name or "haiku-4.5" in name or "opus" in name:
+        return 4096
+    # Sonnet and others: ~1024 tokens
+    return 1500
+
+
 def _block_text_length(block) -> int:
     if isinstance(block, dict):
         if block.get("type") == "text":
@@ -104,10 +124,8 @@ def _block_to_dict_with_cache(block) -> dict:
 
 
 def _transform_system_for_cache(system):
-    """Return new system value for cache_control, or None if unchanged."""
+    """Return system blocks with cache_control, or None if already configured."""
     if isinstance(system, str):
-        if len(system) <= AUTO_CACHE_MIN_SYSTEM_LEN:
-            return None
         return [
             {
                 "type": "text",
@@ -139,17 +157,24 @@ def _transform_system_for_cache(system):
     return None
 
 
-def _kwargs_with_cached_system(kwargs: dict) -> dict:
-    """Override kwargs['system'] only. Header fields are never modified."""
-    if "system" not in kwargs:
-        return kwargs
-
-    new_system = _transform_system_for_cache(kwargs["system"])
-    if new_system is None:
-        return kwargs
-
+def _apply_auto_cache(kwargs: dict) -> dict:
+    """Enable Anthropic prompt caching without touching header fields."""
     call_kwargs = kwargs.copy()
-    call_kwargs["system"] = new_system
+    model = str(call_kwargs.get("model", ""))
+    min_chars = _min_cacheable_chars(model)
+
+    if _system_char_length(call_kwargs.get("system")) < min_chars:
+        return call_kwargs
+
+    # Recommended: top-level automatic caching (Anthropic SDK)
+    if "cache_control" not in call_kwargs:
+        call_kwargs["cache_control"] = CACHE_CONTROL
+
+    if "system" in call_kwargs:
+        new_system = _transform_system_for_cache(call_kwargs["system"])
+        if new_system is not None:
+            call_kwargs["system"] = new_system
+
     return call_kwargs
 
 
@@ -225,7 +250,7 @@ def _wrap_create(
     def tracked_create(*args, **kwargs):
         call_kwargs = kwargs
         if auto_cache and provider == "anthropic":
-            call_kwargs = _kwargs_with_cached_system(kwargs)
+            call_kwargs = _apply_auto_cache(kwargs)
 
         response = None
         success = True
@@ -286,7 +311,8 @@ def track(
         client = track(openai.OpenAI(), project="my-app")
         client.chat.completions.create(...)
 
-    auto_cache: Anthropic only — inject cache_control on long system prompts.
+    auto_cache: Anthropic only — adds cache_control when system is long enough
+    (Haiku 4.5 needs ~4096+ chars; Sonnet ~1500+ chars).
 
     Env: TOKENLENS_API_KEY, TOKENLENS_USER_ID (optional)
     """
