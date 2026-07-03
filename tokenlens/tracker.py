@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 
 ENDPOINT = "https://my-tokenlens.vercel.app/api/track"
 
-AUTO_CACHE_MIN_SYSTEM_LEN = 1024  # legacy alias; see _min_cacheable_chars()
 CACHE_CONTROL = {"type": "ephemeral"}
 
 PRICING = {
